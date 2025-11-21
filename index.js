@@ -241,7 +241,29 @@ function getServerBaseUrl() {
 client.login(DISCORD_TOKEN);
 
 // Start express server
-const serverPort = process.env.PORT || PORT || 3000;
 app.listen(serverPort, () => {
   console.log(`Express server listening on ${serverPort}`);
+
+  // Show possible Railway URLs
+  console.log("🔗 Railway Domain Info:");
+  console.log("RAILWAY_STATIC_URL =", process.env.RAILWAY_STATIC_URL);
+  console.log("RAILWAY_PUBLIC_DOMAIN =", process.env.RAILWAY_PUBLIC_DOMAIN);
+  console.log("PUBLIC_BASE_URL =", process.env.PUBLIC_BASE_URL);
+
+  // Auto-generate full base URL
+  const base =
+    process.env.PUBLIC_BASE_URL ||
+    process.env.RAILWAY_STATIC_URL ||
+    (process.env.RAILWAY_PUBLIC_DOMAIN
+      ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+      : null);
+
+  if (base) {
+    console.log("🌍 Public Base URL:", base);
+    console.log("➡ OAuth Callback URL:", `${base}/oauth2callback`);
+    console.log("➡ Auth Start URL:", `${base}/auth?discordId=YOUR_ID`);
+  } else {
+    console.log("❗ No Railway URL detected yet.");
+  }
 });
+
