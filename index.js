@@ -2,9 +2,15 @@
 require('dotenv').config();
 const express = require('express');
 const { google } = require('googleapis');
-const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
-const { Client, GatewayIntentBits, Routes, ButtonBuilder, ActionRowBuilder, ButtonStyle, Partials } = require('discord.js');
-const { REST } = require('@discordjs/rest');
+const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+const {
+  Client,
+  GatewayIntentBits,
+  ButtonBuilder,
+  ActionRowBuilder,
+  ButtonStyle,
+  Partials
+} = require('discord.js');
 const session = require('express-session');
 const crypto = require('crypto');
 
@@ -14,20 +20,14 @@ const {
   TARGET_CHANNEL_HANDLE, TARGET_CHANNEL_ID, SESSION_SECRET, PORT
 } = process.env;
 
+// quick env check
 if (!DISCORD_TOKEN || !DISCORD_CLIENT_ID || !GUILD_ID || !CHANNEL_ID || !GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !OAUTH_REDIRECT_URI) {
   console.error('Missing env vars. Check .env file.');
   process.exit(1);
 }
 
 // Basic in-memory store for demo (replace with DB in production)
-const verifiedUsers = new Map(); // discordUserId -> { youtubeId, email, verifiedAt }
-
-// Google OAuth2 client
-const oauth2Client = new google.auth.OAuth2(
-  GOOGLE_CLIENT_ID,
-  GOOGLE_CLIENT_SECRET,
-  OAUTH_REDIRECT_URI
-);
+const verifiedUsers = new Map(); // discordUserId -> { youtubeId, email, verifiedAt, subscribed }
 
 // Scopes: youtube.readonly needed to check subscriptions + profile email
 const OAUTH_SCOPES = [
@@ -49,40 +49,45 @@ app.use(session({
 
 // ---------------------------------------------
 // Helper: resolve handle to channelId via YouTube API
-// (uses public channels.list?forUsername or search.list as fallback)
 async function resolveChannelIdFromHandle(handle) {
-  // if handle begins with @, strip it
   let name = handle?.startsWith('@') ? handle.substring(1) : handle;
   if (!name) return null;
 
-  // Use the YouTube Data API via REST (no auth required for public lookup)
   try {
-    // Try channels.list with "forUsername" first (older username)
-    let url1 = `https://www.googleapis.com/youtube/v3/channels?part=id&forUsername=${encodeURIComponent(name)}&key=${GOOGLE_CLIENT_SECRET ? '': ''}`;
-    // But the reliable route is search.list
-    const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${encodeURIComponent(name)}&maxResults=5&key=${process.env.GOOGLE_API_KEY || ''}`;
-
-    // If user provided GOOGLE_API_KEY in env, we can call search.list directly:
+    // Prefer an API key if available (faster and doesn't require OAuth)
     if (process.env.GOOGLE_API_KEY) {
+      const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${encodeURIComponent(name)}&maxResults=1&key=${process.env.GOOGLE_API_KEY}`;
       const resp = await fetch(searchUrl);
       const data = await resp.json();
       if (data && data.items && data.items.length) {
-        // pick the top result
         return data.items[0].snippet.channelId;
       }
     }
+
+    // Fallback: try channels.list (may not work for handles)
+    const url = `https://www.googleapis.com/youtube/v3/channels?part=id&forUsername=${encodeURIComponent(name)}&key=${process.env.GOOGLE_API_KEY || ''}`;
+    const r = await fetch(url);
+    const j = await r.json();
+    if (j && j.items && j.items.length) return j.items[0].id;
   } catch (err) {
-    console.warn('Could not auto-resolve channel id from handle', err.message || err);
+    console.warn('Could not auto-resolve channel id from handle', err?.message || err);
   }
   return null;
 }
 
 // ---------------------------------------------
 // OAuth start: called when user clicks the verify button
-// We'll accept a "state" param which will include discordUserId so we can map back
+// "discordId" is passed in query so we can map back
 app.get('/auth', (req, res) => {
   const { discordId } = req.query;
   if (!discordId) return res.status(400).send('Missing discordId in query');
+
+  // create a fresh OAuth2 client to generate URL (safe)
+  const oauth2Client = new google.auth.OAuth2(
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET,
+    OAUTH_REDIRECT_URI
+  );
 
   const state = Buffer.from(JSON.stringify({ discordId })).toString('base64');
   const url = oauth2Client.generateAuthUrl({
@@ -90,7 +95,7 @@ app.get('/auth', (req, res) => {
     scope: OAUTH_SCOPES,
     state
   });
-  res.redirect(url);
+  return res.redirect(url);
 });
 
 // OAuth callback
@@ -100,21 +105,29 @@ app.get('/oauth2callback', async (req, res) => {
   if (!code || !state) return res.status(400).send('Missing code or state');
 
   let parsed;
-  try { parsed = JSON.parse(Buffer.from(state, 'base64').toString('utf8')); } catch (e) {
+  try {
+    parsed = JSON.parse(Buffer.from(state, 'base64').toString('utf8'));
+  } catch (e) {
     return res.status(400).send('Invalid state');
   }
   const { discordId } = parsed;
   if (!discordId) return res.status(400).send('Missing discordId in state');
 
   try {
-    const { tokens } = await oauth2Client.getToken(code);
-    oauth2Client.setCredentials(tokens);
+    // Create a fresh OAuth client per request to avoid shared credentials
+    const userOauthClient = new google.auth.OAuth2(
+      GOOGLE_CLIENT_ID,
+      GOOGLE_CLIENT_SECRET,
+      OAUTH_REDIRECT_URI
+    );
 
-    // Use YouTube API to check if the authenticated user subscribes to TARGET_CHANNEL_ID
-    let channelId = TARGET_CHANNEL_ID || (await resolveChannelIdFromHandle(TARGET_CHANNEL_HANDLE));
-    if (!channelId) return res.status(500).send('Target channel ID not set and auto-resolve failed. Put TARGET_CHANNEL_ID in .env');
+    const { tokens } = await userOauthClient.getToken(code);
+    userOauthClient.setCredentials(tokens);
 
-    const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
+    const channelId = TARGET_CHANNEL_ID || (await resolveChannelIdFromHandle(TARGET_CHANNEL_HANDLE));
+    if (!channelId) return res.status(500).send('Target channel ID not set and auto-resolve failed. Put TARGET_CHANNEL_ID in .env or set GOOGLE_API_KEY');
+
+    const youtube = google.youtube({ version: 'v3', auth: userOauthClient });
 
     // Query subscriptions where mine=true and forChannelId=channelId
     const subsResp = await youtube.subscriptions.list({
@@ -126,10 +139,10 @@ app.get('/oauth2callback', async (req, res) => {
 
     const isSubscribed = (subsResp.data.items && subsResp.data.items.length > 0);
 
-    // Get basic user info (email, sub)
-    const oauth2 = google.oauth2({ auth: oauth2Client, version: 'v2' });
+    // Get basic user info (email, id)
+    const oauth2 = google.oauth2({ auth: userOauthClient, version: 'v2' });
     const userinfo = await oauth2.userinfo.get();
-    const youtubeId = userinfo.data.id || tokens.id_token || 'unknown';
+    const youtubeId = userinfo.data.id || (tokens.id_token ? 'id_from_token' : 'unknown');
 
     // Save verification state (in-memory store)
     verifiedUsers.set(discordId, {
@@ -139,21 +152,20 @@ app.get('/oauth2callback', async (req, res) => {
       subscribed: isSubscribed
     });
 
-    // Optionally you can notify the Discord bot to update a message — we will just show a friendly page and direct user to return to Discord
+    // Friendly response after verification
     const returnHtml = `
       <h2>Verification ${isSubscribed ? 'success' : 'failed'}</h2>
       <p>${isSubscribed ? 'You are subscribed — go back to Discord to see the ✅.' : 'You are not subscribed to the channel.'}</p>
       <p>You can close this window.</p>
     `;
-    res.send(returnHtml);
+    return res.send(returnHtml);
   } catch (err) {
     console.error('OAuth callback error', err);
-    res.status(500).send('OAuth error: ' + (err.message || err));
+    return res.status(500).send('OAuth error: ' + (err.message || err));
   }
 });
 
-// Endpoint for bot to check verifiedUsers map (bot polls this or uses webhook)
-// For simplicity, expose read-only route to check a discordId
+// Endpoint for bot to check verifiedUsers map (bot polls this)
 app.get('/check/:discordId', (req, res) => {
   const info = verifiedUsers.get(req.params.discordId);
   if (!info) return res.json({ verified: false });
@@ -163,19 +175,18 @@ app.get('/check/:discordId', (req, res) => {
 // ---------------------------------------------
 // Discord bot part
 const client = new Client({
-  intents: [ GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent ],
-  partials: [ Partials.Channel ]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  partials: [Partials.Channel]
 });
 
+// Post a verification message when the client is ready
 client.once('ready', async () => {
   console.log('Discord bot ready:', client.user.tag);
 
-  // Post a verification message with a button in CHANNEL_ID
   try {
     const channel = await client.channels.fetch(CHANNEL_ID);
-    if (!channel) throw new Error('Channel not found');
+    if (!channel) throw new Error('Channel not found or bot lacks access');
 
-    // create a button that users press to verify
     const verifyButton = new ButtonBuilder()
       .setCustomId('verify_sub_button')
       .setLabel('Verify Subscribe')
@@ -183,7 +194,6 @@ client.once('ready', async () => {
 
     const row = new ActionRowBuilder().addComponents(verifyButton);
 
-    // Send a new message (you can keep the messageId if you want to reuse)
     await channel.send({
       content: `Click the button below to verify subscription to the channel ${TARGET_CHANNEL_HANDLE || TARGET_CHANNEL_ID}`,
       components: [row]
@@ -195,75 +205,93 @@ client.once('ready', async () => {
 });
 
 client.on('interactionCreate', async interaction => {
-  if (interaction.isButton()) {
-    if (interaction.customId === 'verify_sub_button') {
-      // Build an OAuth link with discordId in state
+  try {
+    if (interaction.isButton() && interaction.customId === 'verify_sub_button') {
       const discordId = interaction.user.id;
       const authUrl = `/auth?discordId=${encodeURIComponent(discordId)}`;
       const fullUrl = `${getServerBaseUrl()}${authUrl}`;
 
-      // reply ephemerally with a link so only the clicking user sees it
       await interaction.reply({
         content: `Click here to sign in with Google and verify: ${fullUrl}`,
         ephemeral: true
       });
 
-      // optional: start a small poll loop to check when the user finishes auth and update a server message
+      // Poll for verification result for a short time and DM user
       (async () => {
-        // poll for up to 45 seconds for verification result
-        for (let i=0;i<9;i++) {
+        for (let i = 0; i < 12; i++) { // 12 * 5s = 60s
           await new Promise(r => setTimeout(r, 5000));
-          const resp = await fetch(`${getServerBaseUrl()}/check/${discordId}`);
-          const obj = await resp.json();
-          if (obj.verified) {
-            // notify the user or update a channel message — we'll DM them
-            try {
-              const dm = await interaction.user.createDM();
-              await dm.send(`Verification result: ${obj.info.subscribed ? 'Subscribed ✅' : 'Not subscribed ❌'}`);
-            } catch (e) { console.warn('Could not DM user', e.message); }
-            return;
+          try {
+            const resp = await fetch(`${getServerBaseUrl()}/check/${discordId}`);
+            const obj = await resp.json();
+            if (obj.verified) {
+              try {
+                const dm = await interaction.user.createDM();
+                await dm.send(`Verification result: ${obj.info.subscribed ? 'Subscribed ✅' : 'Not subscribed ❌'}`);
+              } catch (e) {
+                console.warn('Could not DM user', e.message);
+              }
+              return;
+            }
+          } catch (e) {
+            // ignore transient fetch errors
           }
         }
+        // timed out
+        try {
+          await interaction.user.createDM().then(dm => dm.send('Verification timed out. Try again.'));
+        } catch (e) { /* ignore */ }
       })();
     }
+  } catch (err) {
+    console.error('interaction handler error', err);
   }
 });
 
-// Helper: determine server base url for OAuth redirection & links. In dev it's localhost:3000
+// Helper: determine server base url for OAuth redirection & links.
 function getServerBaseUrl() {
+  // Priority:
+  // 1) PUBLIC_BASE_URL (explicit)
+  // 2) RAILWAY_STATIC_URL
+  // 3) RAILWAY_PUBLIC_DOMAIN
+  // 4) fallback to localhost (development)
+  const explicit = process.env.PUBLIC_BASE_URL;
+  const railwayStatic = process.env.RAILWAY_STATIC_URL;
+  const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN;
   const port = process.env.PORT || PORT || 3000;
-  // For local testing:
-  if (process.env.NODE_ENV !== 'production') return `http://localhost:${port}`;
-  // Replace with your production HTTPS domain if deployed
-  return process.env.PUBLIC_BASE_URL || `https://yourdomain.example`;
+
+  if (explicit) return explicit.replace(/\/$/, '');
+  if (railwayStatic) return railwayStatic.replace(/\/$/, '');
+  if (railwayDomain) return `https://${railwayDomain.replace(/\/$/, '')}`;
+  return `http://localhost:${port}`;
 }
 
-client.login(DISCORD_TOKEN);
+client.login(DISCORD_TOKEN).catch(err => {
+  console.error('Discord login failed', err);
+  process.exit(1);
+});
 
-// Start express server
+// Start express server (ensure serverPort variable exists)
+const serverPort = process.env.PORT || PORT || 3000;
+
 app.listen(serverPort, () => {
   console.log(`Express server listening on ${serverPort}`);
 
-  // Show possible Railway URLs
-  console.log("🔗 Railway Domain Info:");
+  // Print Railway/public info for quick copy
+  console.log("🔗 Railway / Public Domain Info:");
+  console.log("PUBLIC_BASE_URL =", process.env.PUBLIC_BASE_URL);
   console.log("RAILWAY_STATIC_URL =", process.env.RAILWAY_STATIC_URL);
   console.log("RAILWAY_PUBLIC_DOMAIN =", process.env.RAILWAY_PUBLIC_DOMAIN);
-  console.log("PUBLIC_BASE_URL =", process.env.PUBLIC_BASE_URL);
 
-  // Auto-generate full base URL
   const base =
     process.env.PUBLIC_BASE_URL ||
     process.env.RAILWAY_STATIC_URL ||
-    (process.env.RAILWAY_PUBLIC_DOMAIN
-      ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
-      : null);
+    (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : `http://localhost:${serverPort}`);
 
   if (base) {
     console.log("🌍 Public Base URL:", base);
-    console.log("➡ OAuth Callback URL:", `${base}/oauth2callback`);
-    console.log("➡ Auth Start URL:", `${base}/auth?discordId=YOUR_ID`);
+    console.log("➡ OAuth Callback URL:", `${base.replace(/\/$/, '')}/oauth2callback`);
+    console.log("➡ Auth Start URL:", `${base.replace(/\/$/, '')}/auth?discordId=YOUR_ID`);
   } else {
-    console.log("❗ No Railway URL detected yet.");
+    console.log("❗ No public base URL detected.");
   }
 });
-
